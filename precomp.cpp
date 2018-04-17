@@ -19,9 +19,9 @@
 // version information
 #define V_MAJOR 0
 #define V_MINOR 4
-#define V_MINOR2 128
+#define V_MINOR2 160
 //#define V_STATE "ALPHA"
-#define V_STATE "EXPERIMENTAL (w/ preflate support)"
+#define V_STATE "EXPERIMENTAL (w/ GrittiBanzli)"
 #define V_MSG "USE FOR TESTING ONLY"
 //#define V_MSG "USE AT YOUR OWN RISK!"
 #ifdef UNIX
@@ -95,7 +95,7 @@ using namespace std;
 #include "contrib/packjpg/precomp_jpg.h"
 #include "contrib/packmp3/precomp_mp3.h"
 #include "contrib/zlib/zlib.h"
-#include "contrib/preflate/preflate.h"
+#include "contrib/grittibanzli/grittibanzli.h"
 
 #define CHUNK 262144 // 256 KB buffersize
 #define DIV3CHUNK 262143 // DIV3CHUNK is a bit smaller/larger than CHUNK, so that DIV3CHUNK mod 3 = 0
@@ -537,7 +537,7 @@ int init(int argc, char* argv[]) {
   }
   printf(" - %s\n",V_MSG);
   printf("Free for non-commercial use - Copyright 2006-2018 by Christian Schneider\n");
-  printf("- experimental preflate support - Copyright 2018 by Dirk Steinke\n\n");
+  printf("- experimental GrittiBanzli support - Copyright 2018 by Dirk Steinke\n\n");
 
   // init compression and memory level count
   bool use_zlib_level[81];
@@ -3058,50 +3058,6 @@ void debug_deflate_reconstruct(const recompress_deflate_result& rdres, const cha
   }
 }
 
-class OwnFileInputStream : public InputStream {
-public:
-  OwnFileInputStream(FILE* f) : _f(f), _eof(false) {}
-
-  virtual bool eof() const {
-    return _eof;
-  }
-  virtual size_t read(unsigned char* buffer, const size_t size) {
-    size_t res = own_fread(buffer, 1, size, _f);
-    _eof |= res < size;
-    return res;
-  }
-private:
-  FILE* _f;
-  bool _eof;
-};
-class UncompressedOutStream : public OutputStream {
-public:
-  UncompressedOutStream(bool& in_memory) : _written(0), _in_memory(in_memory) {}
-  ~UncompressedOutStream() {
-    if (!_in_memory) {
-      safe_fclose(&ftempout);
-    }
-  }
-
-  virtual size_t write(const unsigned char* buffer, const size_t size) {
-    print_work_sign(true);
-    if (_in_memory) {
-      if (_written + size >= MAX_IO_BUFFER_SIZE) {
-        _in_memory = false;
-        write_ftempout_if_not_present(_written, true, true);
-      } else {
-        memcpy(decomp_io_buf + _written, buffer, size);
-        _written += size;
-        return size;
-      }
-    }
-    return own_fwrite(buffer, 1, size, ftempout);
-  }
-private:
-  size_t _written;
-  bool& _in_memory;
-};
-
 recompress_deflate_result try_recompression_deflate(FILE* file) {
   if (file == fin) {
     seek_64(file, input_file_pos);
@@ -3112,32 +3068,30 @@ recompress_deflate_result try_recompression_deflate(FILE* file) {
   recompress_deflate_result result;
   memset(&result, 0, sizeof(result));
   
-  OwnFileInputStream is(file);
-  
-  std::vector<unsigned char> unpacked_output;
-  uint64_t compressed_stream_size = 0;
-  result.accepted = preflate_decode(unpacked_output, result.recon_data, 
-                                    compressed_stream_size, is, []() { print_work_sign(true); });
-  result.compressed_stream_size = compressed_stream_size;
+  std::vector<uint8_t> unpacked_output;
+  result.compressed_stream_size = grittibanzli::Grittibanzli(file, &unpacked_output, &result.recon_data, []() { print_work_sign(true); });
+  if (result.compressed_stream_size < 1) {
+    result.uncompressed_stream_size = 0;
+    result.accepted = false;
+    return result;
+  }
+  result.accepted = true;
   result.uncompressed_stream_size = unpacked_output.size();
   {
     result.uncompressed_in_memory = true;
-    UncompressedOutStream uos(result.uncompressed_in_memory);
-    uos.write(unpacked_output.data(), unpacked_output.size());
+    if (unpacked_output.size() >= MAX_IO_BUFFER_SIZE) {
+      result.uncompressed_in_memory = false;
+      write_ftempout_if_not_present(0, true, true);
+      own_fwrite(unpacked_output.data(), 1, unpacked_output.size(), ftempout);
+    } else {
+      memcpy(decomp_io_buf, unpacked_output.data(), unpacked_output.size());
+    }
+    if (!result.uncompressed_in_memory) {
+      safe_fclose(&ftempout);
+    }
   }
   return std::move(result);
 }
-
-class OwnFileOutputStream : public OutputStream {
-public:
-  OwnFileOutputStream(FILE* f) : _f(f) {}
-
-  virtual size_t write(const unsigned char* buffer, const size_t size) {
-    return own_fwrite(buffer, 1, size, _f);
-  }
-private:
-  FILE* _f;
-};
 
 bool try_reconstructing_deflate(FILE* fin, FILE* fout, const recompress_deflate_result& rdres) {
   std::vector<unsigned char> unpacked_output;
@@ -3145,9 +3099,14 @@ bool try_reconstructing_deflate(FILE* fin, FILE* fout, const recompress_deflate_
   if ((int64_t)own_fread(unpacked_output.data(), 1, rdres.uncompressed_stream_size, fin) != rdres.uncompressed_stream_size) {
     return false;
   }
-  OwnFileOutputStream os(fout);
-  bool result = preflate_reencode(os, rdres.recon_data, unpacked_output, []() { print_work_sign(true); });
-  return result;
+  std::vector<uint8_t> deflated;
+  bool r = grittibanzli::Ungrittibanzli(unpacked_output.data(), unpacked_output.size(),
+    rdres.recon_data.data(), rdres.recon_data.size(), &deflated, []() { print_work_sign(true); });
+  if (!r) {
+    return false;
+  }
+  own_fwrite(deflated.data(), 1, deflated.size(), fout);
+  return true;
 }
 bool try_reconstructing_deflate_skip(FILE* fin, FILE* fout, const recompress_deflate_result& rdres, const size_t read_part, const size_t skip_part) {
   std::vector<unsigned char> unpacked_output;
@@ -3158,10 +3117,16 @@ bool try_reconstructing_deflate_skip(FILE* fin, FILE* fout, const recompress_def
   if ((int64_t)fread_skip(unpacked_output.data(), 1, rdres.uncompressed_stream_size, fin) != rdres.uncompressed_stream_size) {
     return false;
   }
-  OwnFileOutputStream os(fout);
-  return preflate_reencode(os, rdres.recon_data, unpacked_output, []() { print_work_sign(true); });
+  std::vector<uint8_t> deflated;
+  bool r = grittibanzli::Ungrittibanzli(unpacked_output.data(), unpacked_output.size(),
+                                        rdres.recon_data.data(), rdres.recon_data.size(), &deflated, []() { print_work_sign(true); });
+  if (!r) {
+    return false;
+  }
+  own_fwrite(deflated.data(), 1, deflated.size(), fout);
+  return true;
 }
-class OwnFileOutputStreamMultiPNG : public OutputStream {
+class OwnFileOutputStreamMultiPNG {
 public:
   OwnFileOutputStreamMultiPNG(FILE* f, 
                       const size_t idat_count, 
@@ -3213,8 +3178,16 @@ bool try_reconstructing_deflate_multipng(FILE* fin, FILE* fout, const recompress
   if ((int64_t)own_fread(unpacked_output.data(), 1, rdres.uncompressed_stream_size, fin) != rdres.uncompressed_stream_size) {
     return false;
   }
+  std::vector<uint8_t> deflated;
+  bool r = grittibanzli::Ungrittibanzli(unpacked_output.data(), unpacked_output.size(),
+                                        rdres.recon_data.data(), rdres.recon_data.size(), &deflated,
+                                        []() { print_work_sign(true); });
+  if (!r) {
+    return false;
+  }
   OwnFileOutputStreamMultiPNG os(fout, idat_count, idat_crcs, idat_lengths);
-  return preflate_reencode(os, rdres.recon_data, unpacked_output, []() { print_work_sign(true); });
+  os.write(deflated.data(), deflated.size());
+  return true;
 }
 
 static uint64_t sum_compressed = 0, sum_uncompressed = 0, sum_recon = 0, sum_expansion = 0;
